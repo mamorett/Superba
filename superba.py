@@ -2,7 +2,7 @@ import argparse
 import math
 import os
 import sys
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, ImageFilter
 import torch
 from diffusers import FluxImg2ImgPipeline, FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
@@ -131,68 +131,119 @@ class SimpleUpscaler:
 
 class USDURedraw:
     def __init__(self):
-        self.tile_width = 512
-        self.tile_height = 512
+        self.tile_width = 1024
+        self.tile_height = 1024
         self.padding = 32
         self.mode = USDUMode.LINEAR
         self.enabled = True
+        self.tile_overlap = 64
+        self.current_pass = 0
 
-    def init_draw(self, width, height):
-        mask = Image.new("L", (width, height), "black")
-        draw = ImageDraw.Draw(mask)
-        return mask, draw
+    def _is_valid_size(self, size):
+        """Check if dimensions are divisible by 8 for VAE compatibility"""
+        return all(dim % 8 == 0 for dim in size)
 
-    def calc_rectangle(self, xi, yi):
-        x1 = xi * self.tile_width
-        y1 = yi * self.tile_height
-        x2 = min(x1 + self.tile_width, xi * self.tile_width + self.tile_width)
-        y2 = min(y1 + self.tile_height, yi * self.tile_height + self.tile_height)
-        return x1, y1, x2, y2
-
-    def process_tile(self, pipe, image, mask, prompt, strength=0.8, steps=25):
-        result = pipe(
-            prompt=prompt,
-            image=image,
-            mask_image=mask,
-            strength=strength,
-            num_inference_steps=steps,
-            guidance_scale=7.5
-        ).images[0]
-        return result
-
-    def linear_process(self, pipe, image, rows, cols, prompt, strength, steps):
-        mask, draw = self.init_draw(image.width, image.height)
-        for yi in range(rows):
-            for xi in range(cols):
-                draw.rectangle(self.calc_rectangle(xi, yi), fill="white")
-                image = self.process_tile(pipe, image, mask, prompt, strength, steps)
-                draw.rectangle(self.calc_rectangle(xi, yi), fill="black")
+    def start(self, pipe, image, rows, cols, prompt, strength, steps):
+        """Main entry point for processing"""
+        if not self.enabled:
+            return image
+            
+        print(f"Starting {self.mode.name} redraw with {rows}x{cols} tiles")
+        self.current_pass += 1
+        
+        if self.mode == USDUMode.LINEAR:
+            return self._linear_pass(pipe, image, rows, cols, prompt, strength, steps)
+        elif self.mode == USDUMode.CHESS:
+            return self._chess_pass(pipe, image, rows, cols, prompt, strength, steps)
         return image
 
-    def chess_process(self, pipe, image, rows, cols, prompt, strength, steps):
-        mask, draw = self.init_draw(image.width, image.height)
-        tiles = [[(xi + yi) % 2 == 0 for xi in range(cols)] for yi in range(rows)]
-        
+    def _linear_pass(self, pipe, image, rows, cols, prompt, strength, steps):
+        """Process tiles in row-major order"""
+        for yi in range(rows):
+            for xi in range(cols):
+                x1, y1, x2, y2 = self.calc_rectangle(xi, yi, image.width, image.height)
+                image = self._process_tile(pipe, image, x1, y1, x2, y2, str(prompt), strength, steps)
+                print(f"Completed tile ({xi},{yi}) [Pass {self.current_pass}]")
+        return image
+
+    def _chess_pass(self, pipe, image, rows, cols, prompt, strength, steps):
+        """Process tiles in chessboard pattern"""
         for phase in [True, False]:
             for yi in range(rows):
                 for xi in range(cols):
-                    if tiles[yi][xi] == phase:
-                        draw.rectangle(self.calc_rectangle(xi, yi), fill="white")
-                        image = self.process_tile(pipe, image, mask, prompt, strength, steps)
-                        draw.rectangle(self.calc_rectangle(xi, yi), fill="black")
+                    if (xi + yi) % 2 == int(phase):
+                        x1, y1, x2, y2 = self.calc_rectangle(xi, yi, image.width, image.height)
+                        image = self._process_tile(pipe, image, x1, y1, x2, y2, str(prompt), strength, steps)
+                        print(f"Processed {'white' if phase else 'black'} tile ({xi},{yi})")
         return image
 
-    def start(self, pipe, image, rows, cols, prompt, strength, steps):
-        if self.mode == USDUMode.LINEAR:
-            return self.linear_process(pipe, image, rows, cols, prompt, strength, steps)
-        elif self.mode == USDUMode.CHESS:
-            return self.chess_process(pipe, image, rows, cols, prompt, strength, steps)
-        return image
+    def calc_rectangle(self, xi, yi, img_width, img_height):
+        """Calculate tile coordinates with overlap and size validation"""
+        # Calculate base coordinates with overlap
+        x1 = max(0, xi * (self.tile_width - self.tile_overlap))
+        y1 = max(0, yi * (self.tile_height - self.tile_overlap))
+        x2 = min(x1 + self.tile_width + self.tile_overlap, img_width)
+        y2 = min(y1 + self.tile_height + self.tile_overlap, img_height)
+
+        # Adjust to meet VAE size requirements
+        adj_width = ((x2 - x1) // 8) * 8
+        adj_height = ((y2 - y1) // 8) * 8
+        return (x1, y1, x1 + adj_width, y1 + adj_height)
+
+    def _process_tile(self, pipe, base_image, x1, y1, x2, y2, prompt, strength, steps):
+        """Core tile processing with overlap and blending"""
+        # Expand tile area with overlap
+        expanded_x1 = max(0, x1 - self.tile_overlap)
+        expanded_y1 = max(0, y1 - self.tile_overlap)
+        expanded_x2 = min(base_image.width, x2 + self.tile_overlap)
+        expanded_y2 = min(base_image.height, y2 + self.tile_overlap)
+
+        # Crop and validate tile
+        tile = base_image.crop((expanded_x1, expanded_y1, expanded_x2, expanded_y2))
+        if not self._is_valid_size(tile.size):
+            new_size = (
+                (tile.width // 8) * 8,
+                (tile.height // 8) * 8
+            )
+            tile = tile.resize(new_size, Image.LANCZOS)
+
+        # Create blending mask
+        mask = Image.new("L", tile.size, 0)
+        draw = ImageDraw.Draw(mask)
+        feather = self.tile_overlap
+        
+        # Draw central rectangle with feathered edges
+        draw.rectangle(
+            (feather, feather, 
+             mask.width - feather, 
+             mask.height - feather),
+            fill=255
+        )
+        mask = mask.filter(ImageFilter.GaussianBlur(feather // 2))
+
+        # Process tile through pipeline
+        result = pipe(
+            prompt=prompt,
+            image=tile,
+            strength=float(strength),
+            num_inference_steps=int(steps),
+            guidance_scale=7.5
+        ).images[0]
+
+        # Ensure result matches tile size
+        if result.size != tile.size:
+            result = result.resize(tile.size, Image.LANCZOS)
+
+        # Blend into base image
+        base_image = base_image.copy()
+        base_image.paste(result, (expanded_x1, expanded_y1), mask=mask)
+        return base_image
+
 
 class USDUSeamsFix:
     def __init__(self):
-        self.tile_width = 512
-        self.tile_height = 512
+        self.tile_width = 1024
+        self.tile_height = 1024
         self.padding = 16
         self.denoise = 0.35
         self.mask_blur = 4
@@ -200,37 +251,37 @@ class USDUSeamsFix:
         self.mode = USDUSFMode.NONE
         self.enabled = False
 
-    def process_tile(self, pipe, image, mask, prompt, steps):
+    def process_tile(self, pipe, image, x1, y1, x2, y2, prompt, steps):
+        tile = image.crop((x1, y1, x2, y2))
         result = pipe(
             prompt=prompt,
-            image=image,
-            mask_image=mask,
+            image=tile,
             strength=self.denoise,
             num_inference_steps=steps,
             guidance_scale=7.5
         ).images[0]
-        return result
+        output = image.copy()
+        output.paste(result, (x1, y1))
+        return output
 
     def half_tile_process(self, pipe, image, rows, cols, prompt, steps):
-        gradient = Image.linear_gradient("L")
-        row_gradient = Image.new("L", (self.tile_width, self.tile_height), "black")
-        row_gradient.paste(gradient.resize((self.tile_width, self.tile_height // 2)), (0, 0))
-        row_gradient.paste(gradient.rotate(180).resize((self.tile_width, self.tile_height // 2)), (0, self.tile_height // 2))
-        col_gradient = Image.new("L", (self.tile_width, self.tile_height), "black")
-        col_gradient.paste(gradient.rotate(90).resize((self.tile_width // 2, self.tile_height)), (0, 0))
-        col_gradient.paste(gradient.rotate(270).resize((self.tile_width // 2, self.tile_height)), (self.tile_width // 2, 0))
-
+        # Process horizontal seams
         for yi in range(rows - 1):
             for xi in range(cols):
-                mask = Image.new("L", (image.width, image.height), "black")
-                mask.paste(row_gradient, (xi * self.tile_width, yi * self.tile_height + self.tile_height // 2))
-                image = self.process_tile(pipe, image, mask, prompt, steps)
+                x1 = xi * self.tile_width
+                y1 = yi * self.tile_height + self.tile_height // 2 - self.width // 2
+                x2 = min(x1 + self.tile_width, image.width)
+                y2 = min(y1 + self.width, image.height)
+                image = self.process_tile(pipe, image, x1, y1, x2, y2, prompt, steps)
 
+        # Process vertical seams
         for yi in range(rows):
             for xi in range(cols - 1):
-                mask = Image.new("L", (image.width, image.height), "black")
-                mask.paste(col_gradient, (xi * self.tile_width + self.tile_width // 2, yi * self.tile_height))
-                image = self.process_tile(pipe, image, mask, prompt, steps)
+                x1 = xi * self.tile_width + self.tile_width // 2 - self.width // 2
+                y1 = yi * self.tile_height
+                x2 = min(x1 + self.width, image.width)
+                y2 = min(y1 + self.tile_height, image.height)
+                image = self.process_tile(pipe, image, x1, y1, x2, y2, prompt, steps)
         return image
 
     def start(self, pipe, image, rows, cols, prompt, steps):
@@ -300,8 +351,8 @@ def main():
     parser.add_argument("--width", type=int, default=2048, help="Target width")
     parser.add_argument("--height", type=int, default=2048, help="Target height")
     parser.add_argument("--scale", type=float, help="Scale factor (overrides width/height)")
-    parser.add_argument("--tile_width", type=int, default=512, help="Tile width")
-    parser.add_argument("--tile_height", type=int, default=512, help="Tile height")
+    parser.add_argument("--tile_width", type=int, default=1024, help="Tile width")
+    parser.add_argument("--tile_height", type=int, default=1024, help="Tile height")
     parser.add_argument("--padding", type=int, default=32, help="Padding for redraw")
     parser.add_argument("--redraw_mode", type=int, default=0, choices=[0, 1, 2], help="0=Linear, 1=Chess, 2=None")
     parser.add_argument("--save_redraw", action="store_true", help="Save upscaled image")
@@ -312,7 +363,7 @@ def main():
     parser.add_argument("--prompt", default="upscaled image", help="Prompt for FLUX")
     parser.add_argument("--safetensor", type=str, help="Path to safetensor file (disables quantization)")
     parser.add_argument("--lora", type=str, help="Path to LoRA file")
-    parser.add_argument("--denoise", type=float, default=0.8, help="Denoise strength")
+    parser.add_argument("--denoise", type=float, default=0.3, help="Denoise strength")
     parser.add_argument("--steps", type=int, help="Number of steps (overrides acceleration default)")
     parser.add_argument("--acceleration", type=str, default="none", choices=["none", "hyper", "alimama"], help="Acceleration method: none, hyper, alimama")
     args = parser.parse_args()
