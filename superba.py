@@ -39,23 +39,28 @@ class FluxUpscaler:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = dtype
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
+        
+        # Load VAE and offload
         self.vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision).to(self.device)
+        self.vae.to("cpu")  # Offload immediately
         
-        # Load transformer with optional safetensor
+        # Load transformer
         self.transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
-        
-        # Load safetensor if provided
         if safetensor_path:
             print(f"Loading transformer from safetensor: {safetensor_path}")
             state_dict = load_file(safetensor_path, device=self.device)
             self.transformer.load_state_dict(state_dict, strict=False)
-            self.transformer.eval()
+        self.transformer.eval()
         
-        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+        # Load text encoders
+        self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype).to(self.device)
+        self.text_encoder.to("cpu")  # Offload immediately
         self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-        self.text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
+        self.text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision).to(self.device)
+        self.text_encoder_2.to("cpu")  # Offload immediately
         self.tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", revision=revision)
         
+        # Assemble pipeline
         self.pipe = FluxImg2ImgPipeline(
             scheduler=self.scheduler,
             vae=self.vae,
@@ -66,7 +71,7 @@ class FluxUpscaler:
             tokenizer_2=self.tokenizer_2,
         )
         
-        # Apply LoRAs if provided
+        # Apply LoRAs, acceleration, quantization...
         if loras:
             for lorafile in loras:
                 lora_name = os.path.basename(lorafile)
@@ -74,16 +79,16 @@ class FluxUpscaler:
                 self.pipe.load_lora_weights(lorafile, weight_name=lora_name)
                 self.pipe.fuse_lora(lora_scale=1.0)
 
-        # Apply acceleration first
         self.default_steps = self._apply_acceleration(acceleration)
+
+        # Offload before quantization
+        self.pipe.enable_model_cpu_offload()        
         
-        # Apply quantization only if no safetensor was provided
         if not safetensor_path:
             print(f"{datetime.datetime.now()} Quantizing transformer to qfloat8")
             quantize(self.transformer, weights=qfloat8)
             freeze(self.transformer)
 
-        self.pipe.enable_model_cpu_offload()
         print(f"FluxUpscaler initialized with acceleration={acceleration}, default_steps={self.default_steps}")
 
 
@@ -95,7 +100,7 @@ class FluxUpscaler:
                 self.pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
                 self.pipe.fuse_lora(lora_scale=0.125)
                 print(f"Successfully loaded Hyper-SD adapter: {ckpt_name}")
-                return 10
+                return 8
             except Exception as e:
                 print(f"Failed to load Hyper-SD: {str(e)}")
                 return 25
@@ -105,7 +110,7 @@ class FluxUpscaler:
                 self.pipe.load_lora_weights(adapter_id)
                 self.pipe.fuse_lora(lora_scale=1.0)
                 print(f"Successfully loaded Alimama adapter: {adapter_id}")
-                return 10
+                return 8
             except Exception as e:
                 print(f"Failed to load Alimama: {e}")
                 return 25
@@ -193,7 +198,7 @@ class USDURedraw:
         feather = self.tile_overlap
         draw.rectangle((feather, feather, mask.width - feather, mask.height - feather), fill=255)
         mask = mask.filter(ImageFilter.GaussianBlur(feather // 2))
-        print(f"Processing tile with steps={steps}")
+        # print(f"Processing tile with steps={steps}")
         result = pipe(prompt=prompt, image=tile, strength=float(strength), num_inference_steps=int(steps), guidance_scale=7.5).images[0]
         if result.size != tile.size:
             result = result.resize(tile.size, Image.LANCZOS)
@@ -309,14 +314,21 @@ def process_directory(input_dir, output_dir, upscale_ratio, tile_width, tile_hei
     flux = FluxUpscaler(acceleration=acceleration, loras=[lora] if lora else None, safetensor_path=safetensor)
     pipe = flux.pipe
     
-    # Determine steps: user-provided overrides, otherwise use acceleration default adjusted by denoise
+    # Warmup step
+    print("Performing warmup...")
+    warmup_img = Image.new("RGB", (128, 128), (255, 255, 255))  # Small white image
+    with torch.no_grad():
+        pipe(prompt="warmup", image=warmup_img, strength=0.3, num_inference_steps=1, guidance_scale=7.5)
+    torch.cuda.empty_cache()    
+    print("Warmup complete.")
+    
+    # Determine steps...
     final_steps = steps if steps is not None else int(flux.default_steps / denoise)
     print(f"Final steps set to: {final_steps} (user-provided={steps}, acceleration default={flux.default_steps}, denoise={denoise})")
 
     valid_extensions = ('.png', '.jpg', '.jpeg', '.webp')
     image_files = [f for f in os.listdir(input_dir) if f.lower().endswith(valid_extensions)]
     
-    # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
     with tqdm(total=len(image_files), desc="Processing Directory") as pbar:
