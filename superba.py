@@ -384,6 +384,8 @@ def main():
     # Use provided steps or fall back to acceleration default
     steps = args.steps if args.steps is not None else default_steps
 
+    steps = int(steps / args.denoise)
+
     # Process
     upscaler = SimpleUpscaler()
     flux_upscaler = USDUpscaler(init_img, upscaler, args.tile_width, args.tile_height, args.save_redraw, args.save_seams_fix)
